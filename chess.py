@@ -1,8 +1,6 @@
 import pygame
 import os
-import math
 import random
-from copy import deepcopy
 
 # Initialize Pygame
 pygame.init()
@@ -15,6 +13,7 @@ BLACK = (0, 0, 0)
 GRAY = (128, 128, 128)
 HIGHLIGHT = (255, 255, 0, 100)
 CHECK_HIGHLIGHT = (255, 0, 0, 100)
+LAST_MOVE_HIGHLIGHT = (0, 255, 0, 100)
 
 # Set up the display
 screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
@@ -104,7 +103,7 @@ def load_piece_image(piece_type, color):
         return create_fallback_piece(piece_type, color)
 
 def create_fallback_piece(piece_type, color):
-    """Create a basic piece shape if SVG loading fails"""
+    """Create a basic piece shape if PNG loading fails"""
     surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
     piece_color = WHITE if color == 'white' else BLACK
     text = piece_type[0].upper() if color == 'white' else piece_type[0].lower()
@@ -214,7 +213,7 @@ class ChessAI:
             for col in range(8):
                 piece = board.board[row][col]
                 if piece and piece.color == color:
-                    valid_moves = board.get_valid_moves(row, col)
+                    valid_moves = board.get_valid_moves(row, col, checking_future=True)
                     for move in valid_moves:
                         moves.append(((row, col), move))
         return moves
@@ -222,6 +221,8 @@ class ChessAI:
     def simulate_move(self, board, move):
         new_board = ChessBoard(create_ai=False, load_images=False)
         new_board.current_turn = board.current_turn
+        new_board.last_move = board.last_move
+        new_board.last_double_pawn = board.last_double_pawn
         
         # Copy board state manually
         for row in range(8):
@@ -234,7 +235,7 @@ class ChessAI:
         
         # Make the move
         from_pos, to_pos = move
-        new_board.move_piece(from_pos, to_pos)
+        new_board.move_piece(from_pos, to_pos, checking_future=True)
         return new_board
 
 class ChessBoard:
@@ -247,6 +248,8 @@ class ChessBoard:
         self.ai = ChessAI('black') if create_ai else None
         self.in_check = {'white': False, 'black': False}
         self.game_over = False
+        self.last_move = None
+        self.last_double_pawn = None
         if load_images:
             self.initialize_board()
 
@@ -323,8 +326,7 @@ class ChessBoard:
             valid_moves.extend(self.get_sliding_moves(row, col, directions))
 
         elif piece.piece_type == 'queen':
-            directions = [(0, 1), (0, -1), (1, 0), (-1, 0),
-                        (1, 1), (1, -1), (-1, 1), (-1, -1)]
+            directions = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
             valid_moves.extend(self.get_sliding_moves(row, col, directions))
 
         elif piece.piece_type == 'knight':
@@ -350,22 +352,41 @@ class ChessBoard:
 
         return valid_moves
 
-    def is_checkmate(self, color):
-        if not self.is_in_check(color):
-            return False
+    def get_valid_moves(self, row, col, checking_future=False):
+        piece = self.board[row][col]
+        if not piece:
+            return []
 
-        # Check if any move can get out of check
-        for row in range(8):
-            for col in range(8):
-                piece = self.board[row][col]
-                if piece and piece.color == color:
-                    valid_moves = self.get_valid_moves(row, col, checking_future=True)
-                    if valid_moves:
-                        return False
-        return True
+        valid_moves = []
+        raw_moves = self.get_raw_moves(row, col)
+
+        # Only simulate future positions if we're not already checking a future position
+        if not checking_future:
+            for move in raw_moves:
+                new_board = ChessBoard(create_ai=False, load_images=False)
+                new_board.last_move = self.last_move
+                new_board.last_double_pawn = self.last_double_pawn
+                
+                # Copy board state manually
+                for r in range(8):
+                    for c in range(8):
+                        current_piece = self.board[r][c]
+                        if current_piece:
+                            new_board.board[r][c] = current_piece.copy()
+                        else:
+                            new_board.board[r][c] = None
+                
+                new_board.move_piece((row, col), move, checking_future=True)
+                
+                if not new_board.is_in_check(piece.color):
+                    valid_moves.append(move)
+        else:
+            # If we're checking a future position, just return raw moves
+            valid_moves = raw_moves
+
+        return valid_moves
 
     def get_raw_moves(self, row, col, checking_attacks=False):
-        """Get valid moves without considering check"""
         piece = self.board[row][col]
         if not piece:
             return []
@@ -388,10 +409,18 @@ class ChessBoard:
             # Diagonal captures
             for dcol in [-1, 1]:
                 new_row, new_col = row + direction, col + dcol
-                if (0 <= new_row < 8 and 0 <= new_col < 8 and 
-                    self.board[new_row][new_col] and 
-                    self.board[new_row][new_col].color != piece.color):
-                    valid_moves.append((new_row, new_col))
+                if (0 <= new_row < 8 and 0 <= new_col < 8):
+                    # Normal capture
+                    if (self.board[new_row][new_col] and 
+                        self.board[new_row][new_col].color != piece.color):
+                        valid_moves.append((new_row, new_col))
+                    # En passant
+                    elif self.last_double_pawn:
+                        last_row, last_col = self.last_double_pawn
+                        if (row == last_row and new_col == last_col and
+                            ((piece.color == 'white' and row == 3) or 
+                             (piece.color == 'black' and row == 4))):
+                            valid_moves.append((new_row, new_col))
 
         elif piece.piece_type == 'rook':
             directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
@@ -437,38 +466,6 @@ class ChessBoard:
                     # Queenside castling
                     if (self.can_castle_queenside(row, piece.color)):
                         valid_moves.append((row, 2))
-
-        return valid_moves  # Return valid_moves at the end of the method
-
-    def get_valid_moves(self, row, col, checking_future=False):
-        piece = self.board[row][col]
-        if not piece:
-            return []
-
-        valid_moves = []
-        raw_moves = self.get_raw_moves(row, col)
-
-        # Only simulate future positions if we're not already checking a future position
-        if not checking_future:
-            for move in raw_moves:
-                new_board = ChessBoard(create_ai=False, load_images=False)
-                
-                # Copy board state manually
-                for r in range(8):
-                    for c in range(8):
-                        current_piece = self.board[r][c]
-                        if current_piece:
-                            new_board.board[r][c] = current_piece.copy()
-                        else:
-                            new_board.board[r][c] = None
-                
-                new_board.move_piece((row, col), move)
-                
-                if not new_board.is_in_check(piece.color):
-                    valid_moves.append(move)
-        else:
-            # If we're checking a future position, just return raw moves
-            valid_moves = raw_moves
 
         return valid_moves
 
@@ -521,6 +518,20 @@ class ChessBoard:
         
         return valid_moves
 
+    def is_checkmate(self, color):
+        if not self.is_in_check(color):
+            return False
+
+        # Check if any move can get out of check
+        for row in range(8):
+            for col in range(8):
+                piece = self.board[row][col]
+                if piece and piece.color == color:
+                    valid_moves = self.get_valid_moves(row, col, checking_future=True)
+                    if valid_moves:
+                        return False
+        return True
+
     def move_piece(self, from_pos, to_pos, checking_future=False):
         from_row, from_col = from_pos
         to_row, to_col = to_pos
@@ -528,6 +539,20 @@ class ChessBoard:
         piece = self.board[from_row][from_col]
         if not piece:
             return
+
+        # Add logging for debugging
+        if not checking_future:
+            print(f"\nMoving {piece.color} {piece.piece_type} from {from_pos} to {to_pos}")
+            print(f"Current turn: {self.current_turn}")
+
+        # Store last move for en passant
+        if not checking_future:
+            self.last_move = (from_pos, to_pos)
+            # Reset last_double_pawn unless this is a double pawn move
+            if piece.piece_type == 'pawn' and abs(to_row - from_row) == 2:
+                self.last_double_pawn = (to_row, to_col)
+            else:
+                self.last_double_pawn = None
 
         # Handle castling
         if piece.piece_type == 'king' and abs(from_col - to_col) == 2:
@@ -542,14 +567,24 @@ class ChessBoard:
                 self.board[to_row][0] = None
                 self.board[to_row][3].has_moved = True
 
+        # Handle en passant capture
+        if (piece.piece_type == 'pawn' and 
+            abs(from_col - to_col) == 1 and 
+            not self.board[to_row][to_col]):
+            # Remove the captured pawn
+            capture_row = from_row
+            self.board[capture_row][to_col] = None
+
         # Make the move
         self.board[to_row][to_col] = piece
         self.board[from_row][from_col] = None
         piece.has_moved = True
 
-        # Check for pawn promotion
+        # Check for pawn promotion with logging
         if piece.piece_type == 'pawn' and (to_row == 0 or to_row == 7):
-            self.board[to_row][to_col] = Piece(piece.color, 'queen')
+            if not checking_future:
+                print(f"Promoting pawn at {to_row}, {to_col} to queen")
+            self.board[to_row][to_col] = Piece(piece.color, 'queen', load_image=not checking_future)
 
         # Only do these checks if we're not simulating a future position
         if not checking_future:
@@ -566,11 +601,74 @@ class ChessBoard:
                 print(f"Checkmate! {winner} wins!")
                 self.game_over = True
 
+    def draw_board(self):
+        for row in range(8):
+            for col in range(8):
+                color = WHITE if (row + col) % 2 == 0 else GRAY
+                pygame.draw.rect(screen, color, 
+                            (col * SQUARE_SIZE, row * SQUARE_SIZE, 
+                                SQUARE_SIZE, SQUARE_SIZE))
+                
+                piece = self.board[row][col]
+                if piece:
+                    screen.blit(piece.image, 
+                            (col * SQUARE_SIZE, row * SQUARE_SIZE))
+
+        # Highlight selected piece's valid moves
+        for row, col in self.valid_moves:
+            highlight_surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), 
+                                            pygame.SRCALPHA)
+            pygame.draw.rect(highlight_surface, HIGHLIGHT, 
+                        (0, 0, SQUARE_SIZE, SQUARE_SIZE))
+            screen.blit(highlight_surface, (col * SQUARE_SIZE, row * SQUARE_SIZE))
+
+        # Highlight last move
+        if self.last_move:
+            from_pos, to_pos = self.last_move
+            for pos in [from_pos, to_pos]:
+                highlight_surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), 
+                                                pygame.SRCALPHA)
+                pygame.draw.rect(highlight_surface, LAST_MOVE_HIGHLIGHT, 
+                            (0, 0, SQUARE_SIZE, SQUARE_SIZE))
+                screen.blit(highlight_surface, 
+                        (pos[1] * SQUARE_SIZE, pos[0] * SQUARE_SIZE))
+
+        # Highlight king in check
+        for row in range(8):
+            for col in range(8):
+                piece = self.board[row][col]
+                if (piece and piece.piece_type == 'king' and 
+                    self.in_check[piece.color]):
+                    check_surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), 
+                                                pygame.SRCALPHA)
+                    pygame.draw.rect(check_surface, CHECK_HIGHLIGHT, 
+                                (0, 0, SQUARE_SIZE, SQUARE_SIZE))
+                    screen.blit(check_surface, (col * SQUARE_SIZE, row * SQUARE_SIZE))
+
     def make_ai_move(self):
         if self.ai and not self.game_over:
             move = self.ai.get_best_move(self)
             if move:
-                self.move_piece(move[0], move[1])
+                from_pos, to_pos = move
+                # Highlight the piece that's about to move
+                self.selected_piece = self.board[from_pos[0]][from_pos[1]]
+                self.selected_pos = from_pos
+                self.valid_moves = [to_pos]
+                
+                # Force a redraw to show the highlight
+                self.draw_board()
+                pygame.display.flip()
+                
+                # Wait a moment to show the planned move
+                pygame.time.wait(500)  # 500ms delay
+                
+                # Make the move
+                self.move_piece(from_pos, to_pos)
+                
+                # Clear highlights
+                self.selected_piece = None
+                self.selected_pos = None
+                self.valid_moves = []
 
 def main():
     chess_board = ChessBoard()
@@ -606,37 +704,7 @@ def main():
                     chess_board.valid_moves = chess_board.get_valid_moves(row, col)
 
         # Draw the board
-        for row in range(8):
-            for col in range(8):
-                color = WHITE if (row + col) % 2 == 0 else GRAY
-                pygame.draw.rect(screen, color, 
-                               (col * SQUARE_SIZE, row * SQUARE_SIZE, 
-                                SQUARE_SIZE, SQUARE_SIZE))
-                
-                piece = chess_board.board[row][col]
-                if piece:
-                    screen.blit(piece.image, 
-                              (col * SQUARE_SIZE, row * SQUARE_SIZE))
-
-        # Highlight valid moves
-        for row, col in chess_board.valid_moves:
-            highlight_surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), 
-                                            pygame.SRCALPHA)
-            pygame.draw.rect(highlight_surface, HIGHLIGHT, 
-                           (0, 0, SQUARE_SIZE, SQUARE_SIZE))
-            screen.blit(highlight_surface, (col * SQUARE_SIZE, row * SQUARE_SIZE))
-
-        # Highlight king in check
-        for row in range(8):
-            for col in range(8):
-                piece = chess_board.board[row][col]
-                if (piece and piece.piece_type == 'king' and 
-                    chess_board.in_check[piece.color]):
-                    check_surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), 
-                                                 pygame.SRCALPHA)
-                    pygame.draw.rect(check_surface, CHECK_HIGHLIGHT, 
-                                   (0, 0, SQUARE_SIZE, SQUARE_SIZE))
-                    screen.blit(check_surface, (col * SQUARE_SIZE, row * SQUARE_SIZE))
+        chess_board.draw_board()
 
         # Draw game over message
         if chess_board.game_over:
